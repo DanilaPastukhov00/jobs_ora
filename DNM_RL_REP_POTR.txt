@@ -1,0 +1,1765 @@
+class DNM_RL_APP;
+@import_plsql(true)
+@name('Текущий отчет')
+@tag('COPIED')
+static method DNM_RL_REP_POTR is
+	@name('Строка валидатора')              public V_DEST_STR    [STRING_32000];
+	@name('ФИО клиента')                    public V_FIO         [STRING_200];
+	@name('Дата создания заявки, с')        public V_CREATE_BEG  [DATE];
+	@name('Дата создания заявки, по')       public V_CREATE_END  [DATE];
+	@name('Дата состояния задолженности')   public V_DATE_REP    [DATE];
+	@name('Статус заявки')                  public V_SOST_APP    [DNM_RL_STATU_REF];
+	@name('Дата подписания договора, с')    public V_SIGN_BEG    [DATE];
+	@name('Дата подписания договора, по')   public V_SIGN_END    [DATE];
+	@name('Дата выдачи кредита, с')         public V_GIVE_BEG    [DATE];
+	@name('Дата выдачи кредита, по')        public V_GIVE_END    [DATE];
+	@name('Дата планируемого закрытия, с')  public V_CLOSE_BEG   [DATE];
+	@name('Дата планируемого закрытия, по') public V_CLOSE_END   [DATE];
+	@name('Дата закрытия, пусто')           public V_CLOSE_NULL  [BOOLEAN];
+	@name('Канал продаж')                   public V_SOURCE      [DNM_RL_DIR_REF];
+	@name('ОКРРБ')                          public V_OKR         [BOOLEAN];
+	@name('ОБН')                            public V_OBN         [BOOLEAN];
+	@name('МККиКС')                         public V_MKK         [BOOLEAN];
+	@name('КК ОО и ДО')                     public V_OO          [BOOLEAN];
+	@name('Нет контролёра')                 public VO_CONTR_NULL [BOOLEAN];
+	@name('Номер договора')                 public V_CRED_NUM    [STRING_30];
+	@name('Сумма кредита, с')               public V_SUM_BEG     [SUMMA];
+	@name('Сумма кредита, по')              public V_SUM_END     [SUMMA];
+	@name('Подразделение')                  public V_CITYS       table of [BOOL_STR];
+	@name('Точка оформления')               public V_POINT       table of [BOOL_STR];
+	-- ПОДКЛЮЧЕНИЕ БИБЛИОТЕК ------------------------------------------------------
+	pragma include([DEBUG_TRIGGER]::[MACRO_LIB]);
+	pragma include(::[REPS_DATA].[LIB_DEBUG]);
+	public pragma include([DNM_P]::[MACRO]);
+	-- ТИПЫ -----------------------------------------------------------------------
+	-- для кэширования подразделений
+	public type dep_rec is record (city varchar2, point varchar2);
+	public type dep_tab is table of dep_rec index by varchar2;
+	public dep_t dep_tab;
+	-- для кэширования андеррайтеров
+	public type und_rec is record (rules varchar2, name varchar2);
+	public type und_tab is table of und_rec index by varchar2;
+	public und_t und_tab;
+	-- МАКРОСЫ --------------------------------------------------------------------
+	pragma macro(xl, '[OOXML]::[API_XL]');
+	pragma macro(wd,'[OOXML]::[API_DOC_SAX]');
+	pragma macro(orsa,'[OOXML]::[API_ORSA]');
+	pragma macro(cp, '::[DOCUMENT].[COPYFILES]');
+	pragma macro(temp, '::[DNM_TEMP_TBL].[LIB]');
+	pragma macro(lp , 	'::[REPS_DATA].[LIB_PRINT]');
+	pragma macro(PutSum,'::[OOXML].[API_XL].put([1], [2], to_char([3], ''999,999,999,999,990.00''));
+					put_max_len([2],[4],[3])', substitute );
+	-- ПЕРЕМЕННЫЕ ------------------------------------------------------------------
+	t_tbl 	&temp.Temp_table; -- RM6964
+	nPage	integer; -- номера страниц для универсального грида
+	-- ФУНКЦИИ И ПРОЦЕДУРЫ ---------------------------------------------------------
+	-- Возвращает строку, содержащую все контакты типа p_TypeDoc
+	function getContacts(p_RlApp ref [DNM_RL_APP], p_TypeContact varchar2(100), p_TypePrivate varchar2(100)) return varchar2(1000) is
+		str varchar2(1000) := null;
+	begin
+		for (select res(res.[NUM]: obj_numb)
+		in p_RlApp.[DEBTOR].[CONTACTS]
+		where res.[NUM] is not null and res.[PRIVATE] = p_TypePrivate and res.[TYPE] = p_TypeContact)
+		loop
+			str := str || bool_char(str is null, null, ', ')|| res.obj_numb;
+		end loop;
+		return str;
+	end;
+	-- RM28229 Подписание договора через ББО
+	public function bbo_sign(p_app ref [DNM_RL_APP]) return boolean is
+	begin
+		for pp_doc in ::[PP_DOCUMENT] all where pp_doc.[OBJ_REF] = p_app
+		loop
+			return true;
+		end loop;
+		return false;
+	end;
+	-- Город подразделения
+	public function get_city_depart(d ref[DEPART]) return varchar2(128) is
+		city_str varchar2(128);
+		dep ref [depart];
+	begin
+		if d.[DEPART_GROUP].[NAME]='Дополнительный офис без кассового узла' then
+			return 'Мини ДО';
+		end if;
+		-- можно попробовать использовать настройку:
+		-- if nvl(::[FP_TUNE].[LIB].get_bool_value('POTREB_MINI_DO',::[FP_TUNE].[LIB].set_canons('DEPART',p_rl_app.[DEPART]),'0')	, false) = true then
+		-- если "1", то это МиниДО
+		-- если "0", то остальные офисы
+		-- Город берем из адреса подразделения с кодом 001-ХХ, то есть, с 6-значного кода
+		-- Если код длиннее, то нижние по уровню подразделения расположены в поселках (Врангель, Ливадия, Пограничный) и не попадают в выборку;
+		-- Точку выдачи берем из наименования подразделения, у которого непустой Тип подразделения; если пустой, то поднимаемся выше по иерархии
+		city_str := null;
+		dep := d;
+		while length(dep.[CODE])> 6
+		loop
+			dep := dep.[HIGH];
+			if dep is null then
+				return 'г Владивосток';
+			end if;
+		end loop;
+		while city_str is null
+		loop
+			for t in dep.[ADDRESSES] where t.[TYPE].[KOD] = 'CORP'
+			loop
+				city_str := replace(nvl([RUNTIME].[VIEWFUN].GetAddressByRef(t, '$CITY '),[RUNTIME].[VIEWFUN].GetAddress(dep.[FILIAL].[BANK], '$CITY ', 'CORP')),
+					'г. Владивосток', 'г Владивосток');
+				city_str := replace(city_str, 'г.', 'г');
+				return city_str;
+			end loop;
+			dep := dep.[HIGH];
+			if dep is null then
+				return 'г Владивосток';
+			end if;
+		end loop;
+		return city_str;
+	end;
+	-- Получить все города
+	public function get_citys_all(v_ct V_CITYS%type) return varchar2 is
+		t integer;
+		citys_all varchar2(2000) :='#';
+	begin
+		for t in 2..v_ct.count
+		loop
+			if v_ct(t).[BOOL] then
+				citys_all := citys_all || v_ct(t).[STR] || '#';
+			end if;
+		end loop;
+		citys_all := replace(citys_all, ' ', '');
+		return citys_all;
+	end;
+	-- Очистка ячейки в ecxel
+	procedure clear(r integer) is
+		w integer;
+		t_numFmtId integer;
+	begin
+		&xl.Delete_Row(r, 1, 1);
+	end;
+	-- Заполнение заголовочной части файла
+	procedure WRITE_HEADER is
+		dd date;
+		t integer;
+		val varchar2;
+		days integer;
+		und ref [DNM_RL_UNDER];
+		user_name varchar2;
+		phone varchar2(1000);
+		citys_all varchar2(2000);
+		dnm_user ref [DNM_RL_USER];
+		shema_all varchar(6000);
+		roles varchar2;
+		role_contr1 varchar2;
+		dep ref [DEPART]; -- ссылка на подразделение заявки
+		sum_ssud number; -- сумма ссудной задолженности
+		sum_pro number; -- сумма просроченной ссудной задолженности
+		check_und boolean; -- фильтр на андеррайтера
+		date_et date; -- дата перехода на новый этап
+		etap varchar2(128); -- история переходов по этапам
+		t_numFmtId integer;
+		date_signed_doc date;
+		date_give_out date; -- для функции ::[DNM_RL_APP].[LIB_MOVING].get_first_date(x.app_id,'GIVE_OUT')+x.TIME_REGION
+		resh_strategy varchar2; -- решение, принятое по Стратегии (пользователем Dynamika%), или контролёром тоже
+		resh_date date; -- дата принятия окончательного решния ::[DNM_RL_APP].[LIB_MOVING].get_date_change(x.app_id,'2',null, 'LOAN_OFFICER', false) +x.TIME_REGION
+		prev_modif boolean; -- признак того, что предыдущее решение было MODIFICATION
+		col_modif integer; -- номер колонки, куда мы вывели решение MODIFICATION
+		ds  ref [PROPERTY_PROD];
+		dop ref [PROPERTIES];
+		UserSignDog ref [USER];
+		check_shema boolean; -- необходимость сверять схему кредитования с фильтром
+		date_last_resh date;
+		num_iskl integer;
+		flag boolean; -- признак того, что решение принято на 2м этапе
+		cred 	ref [PR_CRED];
+		card ref [VZ_CARDS];
+		str varchar2(100);
+		vMainApp ref [DNM_RL_APP];
+		vMainAppIpo ref [DNM_APPFORM];
+		parental_app ref [DNM_RL_APP];
+		--<<#8563(kozlova 04/07/2022)
+		v_dateItogoCreate date;
+		v_TypeOfWebSolution varchar2;
+		v_dateSaveForm date;
+		v_Days integer;
+		-->>
+		v_Creator varchar2;
+		
+		--<< Миролюбова А.А. 20.11.2025 RM37461
+		type seen_uuid  is table of boolean index by varchar2;
+		seen_uuid_0	seen_uuid;
+		seen_uuid_3	seen_uuid;
+		seen_uuid_6	seen_uuid;
+		seen_uuid_90 seen_uuid;
+		all_uuids	seen_uuid;
+
+		conn_val varchar2;
+		bki integer; -- код коннектора
+		
+		act_acc_0 integer; -- подсчет количества активных счетов (статус=00)
+		act_acc_3 integer; -- подсчет количества активных счетов (статус=00)
+		act_acc_6 integer; -- подсчет количества активных счетов (статус=00)
+		act_acc_90 integer; -- подсчет количества активных счетов (статус=00)
+		uni_acc integer; -- количество уникальных счетов	по 3ем БКИ
+		
+		count_total integer := 0; --Количество рефинансируемых кредитов
+		sum_other_potreb number(20,2) := 0; -- реф других банков
+		sum_other_card number(20,2) := 0; -- реф кредитных карт других банков
+		sum_prim_potreb number(20,2) := 0;  -- реф кредитов Прима
+		sum_prim_card number(20,2) := 0; -- реф кредитных карт Прима
+		sum_total number(20,2) := 0; --Общая сумма рефинансируемых кредитов
+		-->> Миролюбова А.А. 20.11.2025 RM37461
+		
+	begin
+		t_numFmtId	:= &xl.get_numFmt('dd.mm.yyyy h:mm:ss'); --164
+		num_iskl := 1;
+		citys_all := get_citys_all(V_CITYS);
+		debug_pipe('Перечень подразделений для отчета: ' || citys_all, 0);
+		check_shema := true;
+		-- RM 6964
+		if t_tbl(1).[B1] then
+			check_shema := false;
+		else
+			t := 2;
+			shema_all := '#';
+			while t <= t_tbl.count
+			loop
+				if t_tbl(t).[B1] then
+					shema_all := shema_all || t_tbl(t).[OBJ_ID] || '#';
+				end if;
+				t := t + 1;
+			end loop;
+			shema_all := replace(shema_all, ' ', '');
+		--debug_pipe('Перечень схем кредитования для отчета: '||shema_all,0);
+		end if;
+		-- кэшируем подразделения
+		debug_pipe('	кэшируем подразделения', 0);
+		dep_t.delete;
+		for (select q(q%id : dep_id,
+	              q.[NAME] :dep_name,
+	              q.[DEPART_TYPE] :dep_type) in ::[DEPART])
+		loop
+			dep_t(q.dep_id).city := get_city_depart(q.dep_id);
+			dep_t(q.dep_id).point := q.dep_name;
+			if not q.dep_type is null or nvl(::[FP_TUNE].[LIB].get_bool_value('DNM_FICT_DEP', ::[FP_TUNE].[LIB].set_canons('DEPART', q.dep_id), '0'),
+				false)= true then
+				dep_t(q.dep_id).point := q.dep_name;
+			else
+				dep := q.dep_id;
+				while dep.[DEPART_TYPE] is null
+				loop
+					if not dep.[HIGH] is null then
+						dep := dep.[HIGH];
+					end if;
+					if dep.[HIGH] is null and dep.[DEPART_TYPE] is null then
+						exit;
+					end if;
+				end loop;
+				dep_t(q.dep_id).point := dep.[NAME];
+			end if;
+		end loop;
+		debug_pipe('	закончили кэшировать подразделения', 0);
+		-- кэшируем справочник андеррайтеров
+		debug_pipe('	кэшируем справочник андеррайтеров', 0);
+		und_t.delete;
+		for (select q(q.[UNDER].[USERNAME] :USERNAME,
+				  q.[RULES]            :RULES,
+				  q.[UNDER].[NAME]     :NAME) in ::[DNM_RL_UNDER]
+				  order by q.[RULES])
+		loop
+			if und_t.exists(q.USERNAME) then
+				und_t(q.USERNAME).rules := und_t(q.USERNAME).rules||','||q.RULES;
+			else
+				und_t(q.USERNAME).rules := q.RULES;
+			end if;
+			und_t(q.USERNAME).name := q.NAME;
+		end loop;
+		debug_pipe('	закончили кэшировать справочник андеррайтеров', 0);
+		t := 3;
+		&xl.Put(t, 1, 'Время запуска: ' || to_char(sysdate, 'dd.mm.yyyy HH24:MI:SS'));
+		t := 5;
+		&xl.Put(t, 1, 'Дата и время создания заявки находится между ' || to_char(V_CREATE_BEG,'dd.mm.yyyy') 
+					|| '  и ' || to_char(V_CREATE_END,'dd.mm.yyyy'));
+					
+		if V_SIGN_BEG is not null OR V_SIGN_END is not null then
+			t := t + 1;
+			&xl.Ins_Row(t, 1, 1, true, true);
+			&xl.Put(t, 1, 'Дата и время подписания договора находится между ' || to_char(V_SIGN_BEG,'dd.mm.yyyy') 
+					|| '  и ' || to_char(V_SIGN_END,'dd.mm.yyyy'));
+		end if;
+		
+		if V_GIVE_BEG is not null OR V_GIVE_END is not null then
+			t := t + 1;
+			&xl.Ins_Row(t, 1, 1, true, true);
+			&xl.Put(t, 1, 'Дата и время выдачи кредита находится между ' || to_char(V_GIVE_BEG,'dd.mm.yyyy') 
+					|| '  и ' || to_char(V_GIVE_END,'dd.mm.yyyy'));
+		end if;
+		
+		if not V_DATE_REP is null then
+			t := t + 1;
+			&xl.Ins_Row(t, 1, 1, true, true);
+			&xl.Put(t, 1, 'Дата состояния задолженности равна ' || to_char(V_DATE_REP,'dd.mm.yyyy'));
+		end if;
+		
+		if not V_CLOSE_BEG is null OR not V_CLOSE_END is null then
+			t := t + 1;
+			&xl.Ins_Row(t, 1, 1, true, true);
+			&xl.Put(t, 1, 'Дата и время планируемого закрытия находится между ' || to_char(V_CLOSE_BEG,'dd.mm.yyyy') 
+						|| '  и ' || to_char(V_CLOSE_END,'dd.mm.yyyy'));
+		end if;
+		
+		t := t + 3;
+		
+		V_CREATE_BEG := trunc(V_CREATE_BEG);
+		V_CREATE_END := trunc(V_CREATE_END);
+		V_SIGN_BEG := trunc(V_SIGN_BEG);
+		V_SIGN_END := trunc(V_SIGN_END);
+		V_GIVE_BEG := trunc(V_GIVE_BEG);
+		V_GIVE_END := trunc(V_GIVE_END);
+		V_CLOSE_BEG := trunc(V_CLOSE_BEG);
+		V_CLOSE_END := trunc(V_CLOSE_END);
+		
+		v_Days := ::[FP_TUNE].[LIB].get_num_value('DNM_RL_APP_TIME_LIVE_REQ', null, '0'); --#8563(kozlova 04/07/2022)
+		-- Выбирается информация по счету
+		for	( select x(  x.[NUM]                                    : NUM
+					, x%id											: APP_ID
+					, to_char(x.[DATE_CREATE] + nvl(x.[DEPART].[DIFFERENCE], 0) / 24, 'dd.mm.yyyy HH24:MI:SS'): DATE_CREATE
+					, x.[DATE_CREATE] + nvl(x.[DEPART].[DIFFERENCE], 0)/ 24 : DATE_CREATE_D
+					, x.[DATE_CREATE]                               : DC
+					, x.[DEBTOR].[LASTNAME] || ' ' || x.[DEBTOR].[FIRSTNAME] || ' ' || x.[DEBTOR].[MIDDLENAME]  : DEBTOR
+					, x.[DEBTOR].[CLIENT]                           : DEBTOR_ID
+					, x.[DEBTOR].[SEX].[VALUE]						: SEX
+					, x.[DEBTOR].[WORK_ARR]							: WORK_ARR
+					, x.[DEBTOR].[MONTH_INCOME]						: INCOME
+					, x.[DEBTOR].[NUM_DEPENDENTS]					: NUM_DEPEND
+					, x.[DEBTOR].[ADDRESSES]						: ADR
+					, x.[DEBTOR].[FAMILY_STATUS]		            : FAMILY
+					, x.[DEBTOR].[SOURCE_INFO]					    : SOURCE
+					, x.[DEBTOR].[FIN_LOAD]                         : FIN_LOAD
+					, x.[RL_COMMENT]                         		: RL_COM
+					, to_char(x.[DEBTOR].[DOB], 'dd.mm.yyyy')		: DOB
+					, floor((sysdate - x.[DEBTOR].[DOB]) / 365)		: VOZ
+					, nvl(x.[DEPART].[NAME], '')					: DEPART
+					, x.[DEPART]								    : DEPART_ID --подразделение, где создана заявка
+					, x.[DEPART].[CODE_ORG]							: DEPART_ORG_ID 
+ 					, x.[DEPART].[DEPART_TYPE]						: DEPART_TYPE
+					, x.[DELIVERY_DEPART]							: DELIVERY_DEPART_ID --подразделение, где выдан кредит
+					, x.[DELIVERY_DEPART].[DEPART_TYPE]				: DELIVERY_DEPART_TYPE
+					, nvl(x.[DEPART].[DIFFERENCE], 0) / 24          : TIME_REGION
+					, x.[DEALER].[NAME]								: DEALER
+					, x.[SHEMA].[NAME]                              : SHEMA
+					, x.[SHEMA].[ADDS]                              : SHEMA_ADDS
+					, nvl(to_char(x.[SHEMA]%id), 'A')				: SHEMA_ID
+					, x.[DNMR_SHEMA].[NAME]                         : PRODUCT
+					, x.[PRC]										: PRC
+					, x.[PSK]										: PSK
+					, x.[SUM_DEBT]									: SUM_DEBT
+					, x.[TYPE_CRED].[CODE]                          : TYPE_CRED
+					, 0                                             : SUM_INS
+					, 0		                                        : END_INS
+					, x.[CRED_DOG].[SUMMA_DOG]						: SUM_DOG
+					, x.[CRED_DOG]%id								: CRED_ID
+					, x.[CRED_DOG].[NUM_DOG]						: NUM_DOG
+					, x.[CRED_DOG].[COM_STATUS].[NAME]				: CR_STATUS
+					, x.[CRED_DOG].[DATE_ENDING]                    : DATE_ENDING_DATE
+					, x.[CRED_DOG].[DATE_CLOSE]                     : DATE_CLOSE_DATE
+					, x.[CRED_DOG].[PROPERTIES]                     : CRED_PROP
+					, x.[OPERATOR].[NAME]                           : OPERATOR
+					, x.[PERIOD_VALUE]								: SROK
+					, x.[APP_STATE].[NAME]							: APP_ST
+					, x.[PDN_ARR]                					: PDN_ARR
+					, '1111111111111111111111111111111111111'  		: CITY 
+					, x.[STRATEGY_POOL]								: BKIS
+					, x.[REFUSE].[WHY].[NAME]						: WHY
+					, x.[REFUSE].[WHY_REFUSE]  			            : WHY_REF
+					, x.[HIST_VALUE]             					: HIST_ARR
+					, x.[LIST_SERV_DOG]          					: LIST_SERV_DOG
+					, x.[REFIN_DOG]              					: REFIN_DOG
+					, x.[ADD_ATTR]               					: ADD_ATTR
+					-- #7910
+					, x.[DNMR_SHEMA].[ADDS] 	 					: SCH_ATTR
+					-- end  #7910
+					, x.[HIST_OPER]									: HIST_OPER --#8227(kozlova 200422)
+					, q.[ANK_ANSWER] 								: CONSENT_TO_ADVERTISING
+					, case when x.[REFUSE].[WHY].[CODE] = 'REFUSE_OPERATOR'
+						   then x.[REFUSE].[COMMENT]
+						   else null
+					  end 											: refuse_loan_officer_reason --причина отказа кредитным инспектором
+					, x.[DEBTOR].[PASSPORT].[SER] 					: PASSPORT_SER
+					, x.[DEBTOR].[PASSPORT].[NUM] 					: PASSPORT_NUM
+					, nvl(x.[INIT_WAY], 'NO')						: INIT_WAY
+					, x.[STAGE] 									: STAGE --RM15763
+					, nvl(x.[DEBTOR].[PFR_DATA].[MONTH_INCOME_WRK], 0) + nvl(x.[DEBTOR].[PFR_DATA].[MONTH_INCOME_PSN], 0) : MONTH_INCOME
+					, x.[CB_REQ_ARR]								: CB_REQ_ARR
+					)
+				in	::[DNM_RL_APP]
+				left join (::[DNM_RL_QUESTION]  all : q)
+				on q%collection = x.[DEBTOR].[LIST_QUESTIONS] and q.[ANK_QUESTION] = 'CONSENT_TO_ADVERTISING' all
+			where nvl(V_SOST_APP, x.[APP_STATE]) = x.[APP_STATE] -------
+		and x%id not in ('400210661359') -------
+		--#8563(kozlova 04/07/2022)
+		and (x.[DATE_CREATE] + v_Days + nvl(x.[DEPART].[DIFFERENCE], 0) / 24) >= nvl(V_CREATE_BEG,
+			(x.[DATE_CREATE] + v_Days + nvl(x.[DEPART].[DIFFERENCE], 0) / 24)) --#8563(kozlova 04/07/2022)
+		and ((x.[DATE_CREATE] + nvl(x.[DEPART].[DIFFERENCE], 0) / 24) < nvl(V_CREATE_END + 1,
+			(x.[DATE_CREATE] + nvl(x.[DEPART].[DIFFERENCE], 0) / 24) + 1)) 
+		
+		and coalesce(V_SOURCE.[CODE], x.[DEBTOR].[SOURCE_INFO], '0') = coalesce(x.[DEBTOR].[SOURCE_INFO], '0') 
+		and x.[PARENT_APP] is null -- заявки поручителей не нужны
+		order by x%id desc
+		)
+		loop
+			if 
+				::[DEPART].[LIB].Level2Depart(stdlib.userid.[DEPART], 1) != ::[DEPART]([CODE]='001-00') 
+				and stdlib.userid.[DEPART].[CODE_ORG] != x.[DEPART_ORG_ID]
+			then
+				continue;
+			end if; --<RM 20118 
+			--<<#8563(kozlova 04/07/2022)
+			v_dateItogoCreate := null;
+			v_dateSaveForm := null;
+			v_TypeOfWebSolution := nvl(::[DNM_RL_APP].[LIB].GetAttr(x.ADD_ATTR,'TypeOfWebSolution'), 'NOT');
+			-- В заявку не должны попадать предварительные заявки
+			if v_TypeOfWebSolution = 'PRELIMINARY' then
+				begin
+					select hist(hist.[OP_DATE]) in ::[DNM_RL_APP_OP] all
+				 where hist%collection = x.HIST_OPER and hist.[OP_CODE] = 'PTB_SAVE_FORM' and hist.[APP_STATE].[CODE] = 'EXPRESS_FORM' and hist.[OP_DATE] = (select hist1 (min(hist1.[OP_DATE])) in ::[DNM_RL_APP_OP] all 
+										   where hist1%collection = x.HIST_OPER and hist1.[OP_CODE] = 'PTB_SAVE_FORM' and hist1.[APP_STATE].[CODE] = 'EXPRESS_FORM'
+					)
+				into v_dateSaveForm;
+				exception when others then
+					null;
+				end;
+				-- если по ним не было операции сохранения анкеты или не была пройдена упрощеная идентификация
+				if v_dateSaveForm is null or ::[DNM_RL_APP].[LIB_MOVING].get_date_oper(x.app_id, 'rlDebtorEasyIdent',
+					'REFUSE')is not null then
+					continue;
+				end if;
+				v_dateItogoCreate := v_dateSaveForm + x.TIME_REGION;
+			end if;
+			if v_dateItogoCreate is null then
+				v_dateItogoCreate := x.DATE_CREATE_D;
+			end if;
+			--#8563>>
+			--#8563(kozlova 04/07/2022)
+			if (v_dateItogoCreate < nvl(V_CREATE_BEG, v_dateItogoCreate) OR (v_dateItogoCreate >= nvl(V_CREATE_END + 1,
+				v_dateItogoCreate + 1))) then --#8563(kozlova 04/07/2022)
+				continue;
+			end if;
+			if instr(upper(replace(x.DEBTOR,' ','')), upper(nvl(replace(V_FIO,' ',''),replace(x.DEBTOR,' ',''))))=0 then
+				--debug_pipe('----- у заявки не подходит ФИО заемщика, исключаем',0);
+				&xl.Put(num_iskl, 1, x.num||'_'||x.app_id||'----- у заявки не подходит ФИО заемщика, исключаем', p_sheet == 2);
+				num_iskl:=num_iskl+1;
+			continue;
+			end if;
+			
+			date_give_out := null;
+			date_signed_doc := null;
+			date_give_out := ::[DNM_RL_APP].[LIB_MOVING].get_first_date(x.app_id, 'GIVE_OUT') + x.TIME_REGION;
+			date_signed_doc := ::[DNM_RL_APP].[LIB_MOVING].get_first_date(x.app_id, 'CONTRACT_SIGNED') + x.TIME_REGION;
+			
+			if coalesce(date_signed_doc, V_SIGN_BEG - 1, sysdate) < coalesce(V_SIGN_BEG, date_signed_doc, sysdate) OR coalesce(date_signed_doc,
+				V_SIGN_END + 1, sysdate) >= coalesce(V_SIGN_END + 1, date_signed_doc + 1, sysdate + 1) 
+			then
+				--debug_pipe('----- у заявки не подходит Дата подписания договора, исключаем',0);
+				&xl.Put(num_iskl, 1, x.num || '_' || x.app_id || '----- у заявки не подходит Дата подписания договора, исключаем', p_sheet == 2);
+				num_iskl := num_iskl + 1;
+				continue;
+			end if;
+			
+			if coalesce(date_give_out, V_GIVE_BEG - 1, sysdate) < coalesce(V_GIVE_BEG, date_give_out, sysdate) OR coalesce(date_give_out,
+				V_GIVE_END + 1, sysdate) >= coalesce(V_GIVE_END + 1, date_give_out + 1, sysdate + 1) 
+			then
+					&xl.Put(num_iskl, 1, x.num || '_' || x.app_id || '----- у заявки не подходит Дата выдачи кредита, исключаем', p_sheet == 2);
+					num_iskl := num_iskl + 1;
+					continue;
+			end if;
+			
+			if x.CRED_ID is null and (not V_CRED_NUM is null OR not V_CLOSE_BEG is null OR not V_CLOSE_END is null) then
+				--debug_pipe('----- у заявки отсутствует кредитный договор, исключаем',0);
+				&xl.Put(num_iskl, 1, x.num||'_'||x.app_id||'----- у заявки отсутствует кредитный договор, исключаем', p_sheet == 2);
+				num_iskl:=num_iskl+1;
+			continue;
+			end if;
+			if nvl(x.NUM_DOG, '0')!=nvl(V_CRED_NUM, nvl(x.NUM_DOG,'0')) then
+				--debug_pipe('----- заявка не подходит по номеру договора, исключаем',0);
+				&xl.Put(num_iskl, 1, x.num||'_'||x.app_id||'----- заявка не подходит по номеру договора, исключаем', p_sheet == 2);
+				num_iskl:=num_iskl+1;
+			continue;
+			end if;
+			if coalesce(x.DATE_ENDING_DATE, V_CLOSE_BEG-1, sysdate)<coalesce(V_CLOSE_BEG, x.DATE_ENDING_DATE, V_CLOSE_BEG,
+				sysdate) OR coalesce(x.DATE_ENDING_DATE, V_CLOSE_END+1, sysdate)>coalesce(V_CLOSE_END, x.DATE_ENDING_DATE, V_CLOSE_BEG,
+				sysdate) then
+				--debug_pipe('----- заявка не подходит по плановой дате окончания, исключаем',0);
+				&xl.Put(num_iskl, 1, x.num||'_'||x.app_id||'----- заявка не подходит по плановой дате окончания, исключаем', p_sheet == 2);
+				num_iskl:=num_iskl+1;
+				continue;
+			end if;
+			if V_CLOSE_NULL and not x.DATE_CLOSE_DATE is null then
+				--debug_pipe('----- заявка не подходит по непустой плановой дате окончания, исключаем',0);
+				&xl.Put(num_iskl, 1, x.num||'_'||x.app_id||'----- заявка не подходит по непустой плановой дате окончания, исключаем',
+					p_sheet == 2);
+				num_iskl:=num_iskl+1;
+			continue;
+			end if;
+			if not x.DEPART_ID is null then
+				x.city := dep_t(x.DEPART_ID).city;
+				
+				if
+					instr(
+						citys_all,
+						replace(substr(x.city, instr(x.city, ' ', 1) + 1), ' ')
+					) = 0
+				then
+					&xl.Put(
+						num_iskl, 1,
+						x.num||'_'||x.app_id||'----- заявка не подходит по подразделению, исключаем. Подразделение заявки - '||x.city,
+						p_sheet == 2
+					);
+					
+					num_iskl:=num_iskl+1;
+				continue;
+				end if;
+			else
+				x.city := 'г Владивосток (пустое подразделение)';
+			end if;
+			if check_shema and instr(shema_all, x.SHEMA_ID)=0 then
+				--debug_pipe('----- заявка не подходит по схеме кредитования, исключаем. Схема кредитования заявки - '||x.shema,0);
+				&xl.Put(num_iskl, 1,
+					x.num||'_'||x.app_id||'----- заявка не подходит по схеме кредитования, исключаем. Схема кредитования заявки - '||x.shema,
+					p_sheet == 2);
+				num_iskl:=num_iskl+1;
+			continue;
+			end if;
+			-- RM 6558: Заявки на доп. продукт Доверие не учитываем, пока не будет решения по ним
+			if [DNM_RL_RELATED]::[LIB].CheckDoverCardApp(x.app_id)= true then
+				resh_strategy := ::[DNM_RL_APP].[LIB_MOVING].get_date_change_user(x.app_id, '2', 'APPROVED', 'APP_STATE', true); -- для false вернутся CHANGE_STAGE, FORM_DOG
+				resh_strategy := nvl(resh_strategy,
+					::[DNM_RL_APP].[LIB_MOVING].get_date_change_user(x.app_id,'2','REFUSE', 'APP_STATE', true)); -- для false вернутся CHANGE_STAGE, FORM_DOG		
+				if resh_strategy is null or ::[DNM_RL_APP].[LIB_MOVING].get_state_change_user(x.app_id, '2', user_name, 'APP_STATE',
+					false)= 'На доработке' then
+					continue;
+				end if;
+			end if;
+			x.sum_dog:=x.sum_debt;
+			for (
+			select i(i.[SUM_SERV] :sum_serv)
+			in x.LIST_SERV_DOG
+			where i.[PAY_WAY] = 'CREDIT' and coalesce(i.[SUM_SERV], 0)> 0)
+			loop
+				x.sum_dog:=x.sum_dog+i.SUM_SERV;
+			end loop;
+			--
+			if x.sum_dog<nvl(V_SUM_BEG, x.sum_dog-1) OR x.sum_dog>nvl(V_SUM_END, x.sum_dog+1) then
+				--debug_pipe('----- заявка не подходит по сумме, исключаем: сумма не попала в интервал: '||x.sum_dog||' min='||nvl(V_SUM_BEG,x.sum_dog-1)||', max='||nvl(V_SUM_END,x.sum_dog+1),0);
+				&xl.Put(num_iskl, 1,
+					x.num||'_'||x.app_id||'----- заявка не подходит по сумме, исключаем: сумма не попала в интервал: '||x.sum_dog||' min='||nvl(V_SUM_BEG,x.sum_dog-1)||', max='||nvl(V_SUM_END,x.sum_dog+1),
+					p_sheet == 2);
+				num_iskl := num_iskl + 1;
+				clear(t);
+			continue;
+			end if;
+			&xl.Put(t, 1, x.num || '_' || x.app_id);
+			&xl.cell(t, 2, x.DATE_CREATE_D, t_numFmtId); --x.DATE_CREATE_D
+			&xl.cell(t, 3, v_dateItogoCreate, t_numFmtId); --#8563(kozlova 05/07/2022)
+			&xl.Put(t, 5, floor((date_give_out - x.DATE_CREATE_D) * 24 * 60));
+			&xl.cell(t, 6, date_signed_doc, t_numFmtId); -- нужна дата начала действия кредитного договора, а не изменение статуса заявки (это может происходитьв разные дни)! Нет, у реквизитов кредита нет времени, а оно нужно 24ЧЧ:МИН:СЕК!	
+			&xl.cell(t, 7, date_give_out, t_numFmtId);
+			&xl.cell(t, 8, x.DATE_ENDING_DATE, t_numFmtId);
+			&xl.cell(t, 9, x.date_close_Date, t_numFmtId);
+			&xl.Put(t, 10, x.debtor);
+			&xl.Put(t, 11, x.sex);
+			&xl.Put(t, 12, x.voz);
+			&xl.Put(t, 13, x.dob);
+			&xl.Put(t, 14, x.PASSPORT_SER);
+			&xl.Put(t, 15, x.PASSPORT_NUM);
+			phone := '';
+			phone := getContactS(x.app_id, 'MOBILE', 'OWN');
+			phone := replace(phone, '+', '');
+			phone := replace(phone, '*', '');
+			if length(phone)= 10 then
+				phone := '7' || phone;
+			end if;
+			if length(phone)= 11 and substr(phone, 1, 1)= '8' then
+				phone := '7' || substr(phone, 2, 10);
+			end if;
+			&xl.Put(t, 16, replace(replace(replace(replace(phone, '-', ''), ' ', ''), '(', ''), ')', ''));
+			&xl.Put(t, 17, getContactS(x.app_id, 'EMAIL', 'OWN'));
+			for (select q(q.[OCCUPATION_CORP]  : OCCUPATION_CORP,
+					 q.[OCCUPATION_CRP_S] : OCCUPATION_CRP_S,
+					 q.[COMPANY]          : COMPANY,
+					 q.[INN]              : INN,
+					 q.[TITLE]            : TITLE,
+					 --> Миролюбова А.А. 10.04.2025 
+					 q.[PHONE_HR]         : PHONE_HR,
+					 q.[DOP_PHONE_HR]     : DOP_PHONE_HR,
+					 q.[PHONE_W]          : PHONE_W,
+					 q.[DOP_PHONE_W]      : DOP_PHONE_W,
+					 q.[CNTR_DATA].[DATE_REG] : DATE_REG
+					 --> !Миролюбова А.А. 10.04.2025 
+					 )
+		in x.work_arr
+		where nvl(q.[SPOUSE_WORK], false)= false and nvl(q.[MAIN], false)= true fetch 1)
+			loop
+				&xl.Put(t, 18, ::[DNM_RL_DIRECT].[LIB].GetName('OCCUPATION_CORP', nvl(q.OCCUPATION_CORP,q.OCCUPATION_CRP_S)));
+				&xl.Put(t, 20, q.COMPANY);
+				
+				&xl.cell(t, 21, to_char(q.DATE_REG, 'DD.MM.YYYY'), t_numFmtId);
+				--> Миролюбова А.А. 10.04.2025 
+				if q.PHONE_W is not  null then
+					&xl.Put(t, 22, q.PHONE_W);
+				else
+					&xl.Put(t, 22, q.DOP_PHONE_W);
+				end if;
+				if q.PHONE_HR is not  null then
+					&xl.Put(t, 23, q.PHONE_HR);
+				else
+					&xl.Put(t, 23, q.DOP_PHONE_HR);
+				end if;
+				-->!Миролюбова А.А. 10.04.2025
+				&xl.Put(t, 24, q.INN);
+				&xl.Put(t, 25, q.TITLE);
+			end loop;
+			&xl.Put(t, 19, ::[DNM_RL_DIRECT].[LIB].GetName('FAMILY_STATUS', x.FAMILY));
+			&xl.Put(t, 26, x.income);
+			for (select q(q.[CITY].[KIND].[NAME]         : KIND,
+					 q.[REGION].[KIND].[SHORT_NAME] : SHORT_NAME,
+					 q.[REGION].[NAME]              : REGION,
+					 q.[REGION_A]                   : REGION_A,
+					 nvl(q.[CITY].[NAME], q.[CITY_STR]): CITY)
+			in x.adr
+			where q.[ADDR_TYPE] = 'REGISTRATION')
+			loop
+				if instr(upper(q.KIND), 'ГОРОД')= 0 then
+					&xl.Put(t, 27, q.SHORT_NAME || ' ' || q.REGION || ' р-н ' || q.REGION_A || ' ' || q.CITY);
+				else
+					&xl.Put(t, 27, q.[CITY]);
+				end if;
+			end loop;
+			for (select q(q.[CITY].[KIND].[NAME]         : KIND,
+					 q.[REGION].[KIND].[SHORT_NAME] : SHORT_NAME,
+					 q.[REGION].[NAME]              : REGION,
+					 q.[REGION_A]                   : REGION_A,
+					 nvl(q.[CITY].[NAME], q.[CITY_STR]): CITY)
+			in x.adr
+			where q.[ADDR_TYPE] = 'FACT')
+			loop
+				if instr(upper(q.KIND), 'ГОРОД')=0 then
+					&xl.Put(t, 28, q.SHORT_NAME || ' ' || q.REGION || ' р-н ' || q.REGION_A || ' ' || q.CITY);
+				else
+					&xl.Put(t, 28, q.CITY);
+				end if;
+			end loop;
+			&xl.Put(t, 29, x.num_depend);
+			&xl.Put(t, 30, x.city);
+			-- Точку выдачи берем из наименования подразделения, у которого непустой Тип подразделения; если пустой, то поднимаемся выше по иерархии
+			if not x.DEPART_ID is null then
+				--&xl.Put(t,	27,	dep_t(x.DEPART_ID).point);	
+				&xl.Put(t, 31, replace(replace(to_char(dep_t(x.DEPART_ID).point), ' ПАО СКБ Приморья '), '"Примсоцбанк"'));
+			else
+				&xl.Put(t, 31, 'пустое подразделение');
+			end if;
+			if upper(to_char(dep_t(x.DEPART_ID).point))like '%НАДЕЖДИНСКОЕ%' then
+				&xl.Put(t, 30, 'г Артем');
+			end if;
+			if not x.DELIVERY_DEPART_ID is null then
+				&xl.Put(t, 32, trim(dep_t(x.DELIVERY_DEPART_ID).city)); --"Подразделение (выдача)"
+				if upper(to_char(dep_t(x.DEPART_ID).point))like '%НАДЕЖДИНСКОЕ%' then
+					&xl.Put(t, 32, 'г Артем');
+				end if;
+				&xl.Put(t, 33, replace(replace(to_char(dep_t(x.DELIVERY_DEPART_ID).point), ' ПАО СКБ Приморья '), '"Примсоцбанк"')); --"Точка оформления (выдача)"
+			end if;
+			&xl.Put(t, 34, x.dealer);
+			&xl.Put(t, 35, ::[DNM_RL_DIRECT].[LIB].GetName('INFO', x.SOURCE));
+			&xl.Put(t, 36, x.product);
+			if ::[DNM_RL_APP].[LIB].GetAttr(x.[ADD_ATTR], 'TypeOfWebSolution')is not null then
+				&xl.Put(t, 37, ::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.APP_ID,'SUM_DEBT'));
+			else
+				&xl.Put(t, 37, ::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_et(x.APP_ID,'1','SUM_DEBT'));
+			end if;
+			&xl.Put(t, 38, x.shema);
+		
+		 -- #7910 sAntipov
+		declare
+			schIsCards boolean default false; -- схема кредитования для карт ? -- 
+			ret_status ::[STATES_CARD].[NEW_STATE]%type;
+			tune_ref   ref [FP_TUNE_ADD];
+			tune_str   varchar2;
+			begin
+				for (select sch(null) in ::[DNM_RL_ATTR] all where sch%collection = x.SCH_ATTR and sch.[CODE] = 'CRED_SHM_CAT' and sch.[VALUE] in ('CARDS','CHANGE_LIM'))
+				loop
+					schIsCards := true;
+				end loop;
+				if schIsCards then
+					cred := x.CRED_ID;
+					begin
+						locate card in ::[VZ_CARDS] all where card.[IP_ACCOUNTS_REF].[PROD_REF] = cred.[OVER_ON_PROD];
+						-- технический статус карты
+						&xl.Put(t, 39, card%statename);
+						-- внебалансовый статус карты
+						for (select h(h.[NEW_STATE] : stat) in card.[HISTORY_STATE] all where h.[RICH] != ::[RICHES]([CODE] = 'PIN_MAILER')order by h%id desc
+							)
+						loop
+							ret_status := substr(h.stat, 1, ::[STATES_CARD].[NEW_STATE]%size);
+							exit;
+						end loop;
+						if ret_status is not null then
+							for 
+								(
+									select v(v.[VAL_NAME] : vname) in ::[FP_TUNE_ADDV] , (::[FP_TUNE_ADD] : t) all
+										where t.[CODE] 		= '<CARD_STATE>' and t.[VALS] 		= v%collection and v.[VAL_CODE]	= ret_status
+								)
+							loop
+								&xl.Put(t, 40, v.vname);
+								exit;
+							end loop;
+						end if;
+					exception when others then
+						null;
+					end;
+				end if;
+			end;
+			-- end #7910
+			vMainApp := null;
+		declare
+			vTypeCred	 varchar2;
+			begin
+				vMainApp := ::[DNM_RL_RELATED].[LIB].GetMainApp(x.APP_ID);
+				if vMainApp is not null then
+					vTypeCred := vMainApp.[TYPE_CRED].[CODE];
+					-- Если это заявка на доверие, забываем ее
+					if nvl(vMainApp.[RELATED_APP].[ADD_CARD], false)= false then
+						vMainApp := null;
+					end if;
+				else
+					for (select atr(atr.[VALUE] : val)
+					in x.[ADD_ATTR] all
+					where atr.[CODE] = 'RefOperAppKKMain' and atr.[VALUE] is not null
+				)
+					loop
+						vTypeCred := atr.val;
+					end loop;
+				end if;
+				if nvl(vTypeCred, ' ')= 'AUTO' or (lower(vMainApp.[SHEMA].[NAME]) like '%рефинансирование автокредита%') or (lower(vMainApp.[DNMR_SHEMA].[NAME] like '%рефинансирование автокредита%')) 
+				then
+					&xl.Put(t, 41, 'Авто');
+				elsif nvl(vTypeCred, ' ')=  'POTR' then
+					&xl.Put(t, 41, 'Потреб');
+				end if;
+			end;
+		--< RM 7715
+		
+		--> RM7581
+		declare
+			rAppIpo ref [DNM_APPFORM];
+			begin
+				rAppIpo := ::[DNM_RL_RELATED].[LIB].GetMainAppIpo(x.APP_ID);
+				if rAppIpo is not null then
+					&xl.Put(t, 42, ::[DNM_RL_APP].[LIB].GetAttr(x.[ADD_ATTR], 'IPO_ROLE'));
+					&xl.Put(t, 43, [DNM_APPFORM]::[UI_LIB].get_prod_name(rAppIpo%id));
+					&xl.Put(t, 44, rAppIpo.[CURRENT_POINT].[NAME]);
+				end if;
+			end;
+			--< RM7581
+			--<<RM15266
+			if x.INIT_WAY = 'POTR_AFTER_IPOT' then
+				declare
+				rAppIpo ref [DNM_APPFORM];
+				begin
+					for rel_app in [DNM_RL_RELATED] all where rel_app.[NEW_APP]%id = x.APP_ID
+					loop
+						rAppIpo := rel_app%parent;
+						exit;
+					end loop;
+					if rAppIpo is not null then
+						&xl.Put(t, 45, ::[DNM_RL_APP].[LIB].GetAttr(x.[ADD_ATTR], 'IPO_ROLE'));
+						&xl.Put(t, 46, [DNM_APPFORM]::[UI_LIB].get_prod_name(rAppIpo%id));
+						&xl.Put(t, 47, rAppIpo.[CURRENT_POINT].[NAME]);
+					end if;
+				end;
+			end if;
+			-->>
+			&xl.Put(t, 48, x.prc);
+			&xl.Put(t, 49, x.psk);
+			if x.psk is null then
+				begin
+					locate ds in [PROPERTY_PROD] where ds.[prod]  = x.CRED_ID and ds.[kind_prop].[CODE]='IRR' and ds.[DATE_END] is null and ds.[value_prop] is not null;
+					&xl.Put(t, 49, ds.[value_prop]);
+				exception when NO_DATA_FOUND then
+					begin
+						locate dop in x.CRED_PROP where dop.[GROUP_PROP].CODE = 'IRR' and dop.[NUM] is not null;
+						&xl.Put(t, 49, dop.[NUM]);
+					exception when NO_DATA_FOUND then
+						null;
+					end;
+				end;
+			end if;
+			&xl.Put(t, 50, x.srok);
+			if x.srok is null then
+				for (select i(i%id :id_adds) in x.SHEMA_ADDS where i.[CODE]='CRED_SHM_CAT' and i.[VALUE] in ('CARDS','CHANGE_LIM'))
+				loop -- не нужно выводить для карточных (Револьверный)
+					&xl.Put(t, 50, '12');
+				end loop;
+			end if;
+			&xl.Put(t, 51, x.sum_dog);
+			&xl.Put(t, 52, x.sum_debt);
+			for (
+			select i(i.[SUM_INS] : sum_ins,
+			         i.[PERIOD]  : period,
+			         i.[TYPE_DOG].[INSUR_TYPE] : type_dog)
+			in x.LIST_SERV_DOG
+			where i.[TYPE_DOG].[CODE] in ('PTB_1','PTB_2','PTB_3','PTB_4','PTB_5','PTB_6','PTB_7','PTB_VSK_M_F','PTB_VSK_M_P','PTB_VSK_O_P','LIVE_HEALTH','LIVE_HEALTH_PRESTIGE','PTB_8','PTB_9','PTB_10') -->6880 Добавлена страховка с кодом PTB-8<-- -->7098 Добавлена страховка с кодом PTB-9<--
+			and coalesce(i.[SUM_INS], 0)> 0)
+			loop
+				x.sum_ins:=x.sum_ins+i.SUM_INS;
+				x.end_ins:=greatest(x.end_ins, i.PERIOD);
+				for r in ::[INSURANCE] where r.[INSURE_PRD]=x.cred_id and r.[KIND_INSURE]=i.TYPE_DOG
+				loop
+					&xl.Put(t, 55, r.[COM_STATUS].[NAME]);
+				end loop;
+			
+			declare
+				bFind boolean := false;
+				rCred ref [PR_CRED];
+				rApp ref [DNM_RL_APP];
+				begin
+					for r in ::[INSURANCE] where r.[INSURE_PRD]=x.cred_id and r.[KIND_INSURE]=i.TYPE_DOG
+					loop
+						&xl.Put(t, 55, r.[COM_STATUS].[NAME]);
+						bFind :=  true;
+					end loop;
+					rCred := X.CRED_ID;
+					-- Rm 16309
+					if not bFind and rCred%id is not null then
+						for r in ::[INSURANCE] 
+					where r.[NUM_POLIS] = rCred.[NUM_DOG] and r.[KIND_INSURE] = i.TYPE_DOG and r.[CLIENT] = x.DEBTOR_ID
+						loop
+							&xl.Put(t, 55, r.[COM_STATUS].[NAME]);
+							bFind := true;
+						end loop;
+					end if;
+					if not bFind and rCred%id is not null then
+						rApp := x.APP_ID;
+						for r in ::[INSURANCE] 
+					where r.[KIND_INSURE] = i.TYPE_DOG and r.[CLIENT] = x.DEBTOR_ID and r.[DATE_BEGIN] = rCred.[DATE_BEGIN] and exists (select srv(srv)
+								in rApp.[LIST_SERV_DOG]
+								where nvl(srv.[PAY_WAY], 'NO')= 'CREDIT' and srv.[SUM_SERV] is not null and srv.[SUM_SERV] = r.[SUMMA_COMMISS]
+									)
+						loop
+							&xl.Put(t, 55, r.[COM_STATUS].[NAME]);
+							bFind := true;
+						end loop;
+					end if;
+				end;
+			end loop;
+			&xl.Put(t, 53, x.sum_ins);
+			&xl.Put(t, 54, x.end_ins);
+			-------------------------
+			-- надо проверить на соответствие параметрам "Контролёр" с экранной формы (5 логических параметров в разрезе  ролей, в том числе "пусто"; работают через ИЛИ)
+			-- 53, 55, 57, 59
+			roles:='#';
+			if V_OKR then
+				roles:=roles||'ОКРРБ#';
+			end if;
+			if V_OBN then
+				roles:=roles||'ОБН#';
+			end if;
+			if V_MKK then
+				roles:=roles||'MKK/КС#';
+			end if;
+			if V_OO then
+				roles:=roles||'КК и ДО/ОО#';
+			end if;
+			if VO_CONTR_NULL then
+				roles:=roles||'НЕТ#'; -- если решение принял оператор, то его нет в справочнике Андеррайтеров; такие заявки должны попадать с галкой "нет контролера" на экранной форме
+			end if;
+			role_contr1:='#НЕТ#';
+			check_und:=false;
+			prev_modif:=false;
+			col_modif:=0;
+			flag:=false;
+			for (
+			select w (w.[DATE_EDIT] : DATE_EDIT,
+					  w.[USER]      : USER_EDIT,
+					  case
+					  	when w.[VALUE] = 'APPROVED'     then 'Одобрено'
+					  	when w.[VALUE] = 'MODIFICATION' then 'На доработку'
+					  	when w.[VALUE] in ('ECREDIT_REFUSE_OKR', 'PRE_REFUSE_OKR', 'REFUSE') then 'Отказано'
+					  	else  w.[VALUE]
+					  end : VALUE,
+					  w.[PARAM]     : PARAM,
+					  w.[VALUE]     : VAL )			
+		    in x.HIST_ARR
+			where w.[PARAM] in ('APP_STATE','STAGE') and w.[VALUE] in ('APPROVED','REFUSE','MODIFICATION','ECREDIT_REFUSE_OKR', 'PRE_REFUSE_OKR','1','2','3') --RM10218(kozlova_210323) and w.[USER] not in ('DYNAMIKA_NEW','DYNAMIKA_FR')
+			and (w.[USER] not in ('DYNAMIKA_NEW','DYNAMIKA_FR') and w.[PARAM] = 'APP_STATE' or w.[PARAM] = 'STAGE') --RM10218(kozlova_210323)
+			order by w.[DATE_EDIT], w%id asc)
+			loop
+				if w.param='STAGE' and w.VAL='2' then
+					flag:=true;
+				elsif nvl(::[DNM_RL_APP].[LIB].GetAttr(x.[ADD_ATTR],'TypeOfWebSolution'), ' ')= 'FINAL' then
+					flag:=true;
+				elsif vMainApp is not null then
+					flag:=true;
+				end if;
+				if w.PARAM='APP_STATE' and flag then
+					if und_t.exists(w.USER_EDIT) then
+						-- надо затереть решение MODIFICATION, если после него были 'APPROVED','REFUSE', принятые контролером, а не оператором; бывает 2 подряд MODIF, такие тоже нужно затирать
+						if w.VALUE in ('Одобрено','Отказано','На доработку') and prev_modif then
+							&xl.Put(t, col_modif, '');
+							&xl.Put(t, col_modif+1, '');
+							prev_modif:=false;
+							if col_modif = 78 then -- если решение принял "КК и ДО/ОО, он же имеет и роль ОБН, надо затереть решения в обоих колонках"
+								&xl.Put(t, 74, '');
+								&xl.Put(t, 75, '');
+							end if;
+						end if;
+						if w.VALUE='На доработку' then
+							prev_modif:=true;
+						end if;
+						if instr(nvl(::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,'ORG_RESOLUTION',w.DATE_EDIT),und_t(w.USER_EDIT).RULES),
+							'ОКРРБ')!=0 then
+							&xl.Put(t, 73, w.VALUE);
+							&xl.Put(t, 74, und_t(w.USER_EDIT).NAME);
+							col_modif:=73;
+						end if;
+						if instr(nvl(::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,'ORG_RESOLUTION',w.DATE_EDIT),und_t(w.USER_EDIT).RULES),
+							'ОБН')!=0 then
+							&xl.Put(t, 75, w.VALUE);
+							&xl.Put(t, 76, und_t(w.USER_EDIT).NAME);
+							col_modif:=75;
+						end if;
+						if instr(nvl(::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,'ORG_RESOLUTION',w.DATE_EDIT),und_t(w.USER_EDIT).RULES),
+							'MKK/КС')!=0 then
+							&xl.Put(t, 77, nvl(w.VALUE, w.VAL));
+							&xl.Put(t, 78, und_t(w.USER_EDIT).NAME);
+							col_modif:=77;
+						end if;
+						if instr(nvl(::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,'ORG_RESOLUTION',w.DATE_EDIT),und_t(w.USER_EDIT).RULES),
+							'КК и ДО/ОО')!=0 then
+							&xl.Put(t, 79, w.VALUE);
+							&xl.Put(t, 80, und_t(w.USER_EDIT).NAME);
+							col_modif:=79;
+						end if;
+						-- у некоторых контролёров может быть 2 роли, например "КК и ДО/ОО,ОБН"
+						if und_t(w.USER_EDIT).RULES='КК и ДО/ОО,ОБН' and ::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,
+							'ORG_RESOLUTION', w.DATE_EDIT)is null then -- может быть в другом порядке
+							if (instr(roles, '#КК и ДО/ОО#')+instr(roles, '#ОБН#'))!=0 then
+								check_und:=true;
+							end if;
+						elsif instr(roles,
+							'#'||nvl(::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,'ORG_RESOLUTION',w.DATE_EDIT),und_t(w.USER_EDIT).RULES)||'#')=0 then
+							role_contr1:='#0#';
+						else
+							role_contr1:='#'||nvl(::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,'ORG_RESOLUTION',w.DATE_EDIT),
+								und_t(w.USER_EDIT).RULES)||'#';
+							check_und:=true;
+						-- в этом случае проверку на контролёра можно считать пройденной
+						-- например, нужны заявки с контролёрами #A#B#C#, а у нас есть контролёры #B#D#C# (да, могут быть в другом порядке)
+						end if;
+					else
+						role_contr1:='#НЕТ#'; -- это действие выполнил Оператор
+					end if;
+				end if;
+				if w.param='STAGE' and w.VAL!='2' then
+					flag:=false;
+				end if;
+			end loop;
+			if instr(roles, role_contr1)= 0 and not check_und then
+				--debug_pipe('----- заявка не подходит по роли контролёра, исключаем. Роль контролёра - '||role_contr1||', Допустимые роли - '||roles,0);
+				&xl.Put(num_iskl, 1, x.num || '_' || x.app_id || ' заявка не подходит по роли контролёра, исключаем.', p_sheet == 2);
+				num_iskl := num_iskl + 1;
+				clear(t);
+			continue;
+			end if;
+			-----------------------------
+
+			--<< Миролюбова А.А. 16.02.2026 RM37461 Подсчёт уникальных действующих кредитов по УИД по 3-ем БКИ и КБКИ
+			conn_val:='#0#3#6#';
+			
+			act_acc_0:=0;
+			act_acc_3:=0;
+			act_acc_6:=0;
+			act_acc_90 := null;
+			uni_acc:=0;
+		
+			seen_uuid_0.delete;
+			seen_uuid_3.delete;
+			seen_uuid_6.delete;
+			seen_uuid_90.delete;
+			all_uuids.delete;
+			
+			-- Считываем значения с БКИ
+			for (select t(t.[REQUEST] : REQUEST) in x.[BKIS] where not t.[REQUEST] is null and not t.[UUID_INSTANCE] is null order by t.[POOL_DATE] desc)
+	    loop
+
+				if instr(conn_val,t.[REQUEST].[CONNECTOR])!=0 or (t.[REQUEST].[CONNECTOR] = '90' and act_acc_90 is null ) then  -- каждое БКИ нужно только 1 раз
+					
+					conn_val:=replace(conn_val,t.[REQUEST].[CONNECTOR],'#');
+					bki:=t.[REQUEST].[CONNECTOR]; --'0','НБКИ','6','ОКБ','3','Эквифакс', '90', 'КБКИ'
+	
+					if bki = '0' or bki = '3' or bki = '6' then -- < ищем все договоры, пришедшие из трех БКИ
+						
+						for (select t1(upper(t1.[VALUE]) : UUID)
+								in t.[REQUEST].[ANSWER].[REQS_VALS] 
+								where t1.[NAME].[CODE]='UUID' and t1.[VALUE] is not null
+								and exists ( select t2(1)
+									in t.[REQUEST].[ANSWER].[REQS_VALS]
+									where t1.[COLL_ID] = t2%id
+										and t2.[NAME].[HIGH_LEVEL].[CODE]='LOANS'
+										and t2.[NAME].[CODE] = 'LOAN')
+								and exists ( select t3(1)
+									in t.[REQUEST].[ANSWER].[REQS_VALS]
+									where t3.[COLL_ID] = t1.[COLL_ID]
+										and t3.[NAME].[HIGH_LEVEL].[CODE] = 'LOAN'
+										and t3.[NAME].[CODE] ='STATUS'
+										and t3.[VALUE] = '00')
+							)
+						loop -- Считает количество кредитов по вем тем БКИ
+							
+						        if bki = '0' then
+						            if not seen_uuid_0.exists(t1.UUID) then -- Проверяем, встречался ли мы этот UUID в BKI 0 раньше
+						                act_acc_0 := act_acc_0 + 1;
+						                seen_uuid_0(t1.UUID) := true; -- Помечаем как увиденный
+						            end if;
+						            
+						        elsif bki = '3' then
+						            if not seen_uuid_3.exists(t1.UUID) then
+						                act_acc_3 := act_acc_3 + 1;
+						                seen_uuid_3(t1.UUID) := true;
+						            end if;
+						            
+						        elsif bki = '6' then
+						            if not seen_uuid_6.exists(t1.UUID) then
+						                act_acc_6 := act_acc_6 + 1;
+						                seen_uuid_6(t1.UUID) := true;
+						            end if;
+						            
+						        end if;
+						        
+						        if not all_uuids.exists(t1.UUID) then -- Общий подсчет уникальных UUID по всем БКИ
+						            uni_acc := uni_acc + 1;
+						            all_uuids(t1.UUID) := true;
+						        end if;
+	
+						end loop;
+						
+					end if; --ищем все договоры, пришедшие из трех БКИ
+					
+					
+					if bki = '90' then -- ищем все договоры, пришедшие из  КБКИ
+					
+						act_acc_90 := 0;
+
+						for (select t1(distinct  upper( t1.[VALUE]) : UUID) in t.[REQUEST].[ANSWER].[REQS_VALS]
+							where t1.[NAME].[CODE]='UUID' and t1.[VALUE] is not null)
+					    loop
+
+					        if not seen_uuid_90.exists(t1.UUID) then -- Подстчёт унакальных УИД по КБКИ
+				                act_acc_90 := act_acc_90 + 1;
+				                seen_uuid_90(t1.UUID) := true;
+				            end if;
+				            
+				             if not all_uuids.exists(t1.UUID) then -- Общий подсчет уникальных UUID по всем БКИ
+					            uni_acc := uni_acc + 1;
+					            all_uuids(t1.UUID) := true;
+					        end if;
+					        
+					    end loop;
+					    
+					end if; -- ищем все договоры, пришедшие из  КБКИ
+					
+				end if; -- conn_val	
+				
+			end loop; -- Считываем значения с БКИ
+			
+			
+			if instr(conn_val, '0') = 0 then
+				&xl.Put(t, 56, act_acc_0); -- НБКИ
+			else 
+				&xl.Put(t, 56, '-'); 
+			end if;
+			
+			if instr(conn_val, '3') = 0 then
+				&xl.Put(t, 57, act_acc_3); -- Эквифакс
+			else 
+				&xl.Put(t, 57, '-'); 
+			end if;
+			
+			if instr(conn_val, '6') = 0 then
+				&xl.Put(t, 58, act_acc_6); -- ОКБ
+			else 
+				&xl.Put(t, 58, '-'); 
+			end if;
+			
+			if not act_acc_90 is null then
+				&xl.Put(t, 59, act_acc_90); -- КБКИ
+			else 
+				&xl.Put(t, 59, '-'); 
+			end if;
+			
+			if instr(conn_val, '0') != 0 and instr(conn_val, '3') != 0 and instr(conn_val, '6') != 0 and act_acc_90 is null then 
+				&xl.Put(t, 60, '-'); 
+			else 
+				&xl.Put(t, 60, uni_acc); -- количество крредитов из трех БКИ/КБКИ
+			end if;
+			
+			-->> Миролюбова А.А. 16.02.2026 RM37461
+			
+	
+			--<< Миролюбова А.А. 16.02.2026 RM37461 Рефинансированные кредиты 
+			count_total := 0; --Количество рефинансируемых кредитов
+			sum_other_potreb  := 0; -- реф других банков
+			sum_other_card  := 0; -- реф кредитных карт других банков
+			sum_prim_potreb := 0;  -- реф кредитов Прима
+			sum_prim_card  := 0; -- реф кредитных карт Прима
+			sum_total := 0; --Общая сумма рефинансируемых кредитов
+		
+			for (select i(i.[SUMMA] : SUMMA, i.[TYPE_CRED] : TYPE_CRED, i.[REQ_PAY].[0] : REQ_PAY) in x.[REFIN_DOG])
+		    loop
+		        count_total := count_total + 1;
+		        sum_total := sum_total + i.[SUMMA];
+		
+		        if (i.[REQ_PAY] = 2) then
+		            if (i.[TYPE_CRED] in ('POTREB','IPOTEKA','GUARANT','AVTO')) then
+		                sum_other_potreb := sum_other_potreb + i.[SUMMA];
+		            elsif (i.[TYPE_CRED] in ('CARD')) then
+		                sum_other_card := sum_other_card + i.[SUMMA];
+		            end if;
+		        elsif (i.[REQ_PAY] = 1) then
+		            if (i.[TYPE_CRED] in ('POTREB','IPOTEKA','GUARANT','AVTO')) then
+		                sum_prim_potreb := sum_prim_potreb + i.[SUMMA];
+		            elsif (i.[TYPE_CRED] in ('CARD')) then
+		                sum_prim_card := sum_prim_card + i.[SUMMA];
+		            end if;
+		        end if;
+		    end loop;
+		    
+		    &xl.Put(t, 61, count_total);
+			&xl.Put(t, 62, sum_other_potreb);
+			&xl.Put(t, 63, sum_other_card);
+			&xl.Put(t, 64, sum_prim_potreb);
+			&xl.Put(t, 65, sum_prim_card);
+			&xl.Put(t, 66, sum_total);
+			-->> Миролюбова А.А. 16.02.2026 RM37461
+			
+			vMainAppIpo := ::[DNM_RL_RELATED].[LIB].GetMainAppIpo(x.APP_ID); -- RM 7581
+			begin
+				select xx(xx.[USER].[NAME]) in ::[DNM_RL_APP_OP] all 
+				where xx%collection = x.HIST_OPER and (xx.[OP_CODE] in ('NEW_AUTO','NEW_EXP_FORM', 'CreateNewApp') OR xx.[OP_NAME] = 'Создание заявки') 
+					order by xx.[OP_DATE]
+					fetch 1 into v_Creator;
+			exception when others then null;
+			end;
+			
+			if vMainAppIpo is not null then
+				&xl.Put(t, 67, vMainAppIpo.[LOAN_ISP].[NAME]);
+			elsif nvl(::[DNM_RL_APP].[LIB].GetAttr(x.[ADD_ATTR],'TypeOfWebSolution'), ' ')= 'FINAL' then
+				&xl.Put(t, 67, 'Web Pskb');
+			--<<RM8950(kozlova_230123)
+			elsif x.INIT_WAY = 'CARD_AFTER_ZP' then
+				&xl.Put(t, 67, ::[USER]([USERNAME] = 'DYNAMIKA_FR').[NAME]);
+			-->>
+			else
+				--<<RM10218(kozlova_210323)
+				begin
+					::[DNM_ECREDIT_APP]%locate(z where z.[APP] = x.app_id);
+					&xl.Put(t, 67, 'E-credit');
+				exception when others then
+					-->>
+					--<<RM9426(kozlova_021122)
+					&xl.Put(t, 67, v_Creator);
+				-->>
+				end;
+			end if;
+			--> RM 7581
+			date_last_resh:= ::[DNM_RL_APP].[LIB_MOVING].get_date_change(x.app_id, '2', '#APPROVED#', 'APP_STATE', false, null, null, null);
+			--< RM 7581
+			if nvl(::[DNM_RL_APP].[LIB].GetAttr(x.[ADD_ATTR],'TypeOfWebSolution'), ' ')= 'FINAL' then
+				-- Если никто не отправляла на контроль, то Web Pskb
+				&xl.Put(t, 68, nvl(::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'PTB_CHECK_APP_S2','CREATE_FORM'), 'Web Pskb'));
+			else
+				--RM 7715: Для КК 2 в 1 выводим инфу с основной заявки
+				if vMainApp is not null then
+					-- иногда стутус заявки меняет стратегия; а нам нужен живой человек, который внес изменения в заявку, сохранил и отправил контролёрам
+					&xl.Put(t, 68,
+						nvl(::[DNM_RL_APP].[LIB_MOVING].get_user_oper(vMainApp,'SAVE_APP','CREATE_FORM'),::[DNM_RL_APP].[LIB_MOVING].get_user_oper(vMainApp,'PTB_CHECK_APP_S2','CREATE_FORM')));
+				elsif vMainAppIpo is not null then
+					&xl.Put(t, 68, ::[DNM_FLOW_HIST].[LIB].GetUserNewRech(vMainAppIpo,'FOR_OKP'));
+				else
+					-- иногда стутус заявки меняет стратегия; а нам нужен живой человек, который внес изменения в заявку, сохранил и отправил контролёрам
+					&xl.Put(t, 68,
+						nvl(::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'SAVE_APP','CREATE_FORM'),::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'PTB_CHECK_APP_S2','CREATE_FORM')));
+				end if;
+			end if;
+			
+			if x.TYPE_CRED='POTR' and [DNM_RL_APP].[LIB].is_autocred(x.app_id) = False then
+				if nvl(::[DNM_RL_APP].[LIB].GetAttr(x.[ADD_ATTR],'TypeOfWebSolution'), ' ')= 'FINAL' then
+					-- Если никто не отправляла на контроль, то Web Pskb
+					&xl.Put(t, 69, nvl(::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'PTB_CHECK_APP_S2','CREATE_FORM'), 'Web Pskb'));
+				else
+					--RM 8015: Для КК 2 в 1 выводим инфу с основной заявки
+					if vMainApp is not null then
+							&xl.Put(t, 69, coalesce(::[DNM_RL_APP].[LIB_MOVING].get_user_oper(vMainApp,'PTB_CHECK_APP_S2','CREATE_FORM'),
+								::[DNM_RL_APP].[LIB_MOVING].get_user_oper(vMainApp,'SAVE_APP','CREATE_FORM')
+							));
+					elsif vMainAppIpo is not null then
+						&xl.Put(t, 69, ::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'SET_GIVE_CRED','CONTRACT_SIGNED'));
+					else
+						-- иногда стутус заявки меняет стратегия; а нам нужен живой человек, который внес изменения в заявку, сохранил и отправил контролёрам
+							&xl.Put(t, 69, coalesce(::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'PTB_CHECK_APP_S2','CREATE_FORM'),
+								::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'SAVE_APP','CREATE_FORM')
+							));
+					end if;
+				end if;
+
+				if x.[INIT_WAY] in ('FACTURA', 'WEB') and x.[APP_ST] = 'Кредит выдан' then
+					&xl.Put(t, 69, ::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'SET_GIVE_CRED','CONTRACT_SIGNED'));
+				end if;
+
+			else
+				begin --Бакаев Д.В 13/04/2023 вернули оператора для мотивации
+					dnm_user:=null;
+					for (select t(t.[VALUE] :VAL) in x.ADD_ATTR where t.[CODE]='OperMotivation')
+					loop
+						dnm_user:=t.VAL;
+					end loop;
+					if not dnm_user is null then
+						&xl.Put(t, 69, dnm_user.[USER].[NAME]);
+					else
+						&xl.Put(t, 69, ::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'SET_GIVE_CRED','CONTRACT_SIGNED'));
+					end if;
+				exception when others then
+					&xl.Put(t, 69, ::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'SET_GIVE_CRED','CONTRACT_SIGNED'));
+				end;
+			end if;
+			date_et := null;
+			date_et := ::[DNM_RL_APP].[LIB_MOVING].get_date_by_stage(x.app_id, '3', false);
+			if x.TYPE_CRED = 'POTR' then
+				date_et := ::[DNM_RL_APP].[LIB_MOVING].get_date_by_stage(x.app_id, '2', false); -- 3 этап есть только у автокредитов
+			end if;
+			&xl.Put(t, 70, ::[DNM_RL_APP].[LIB_MOVING].get_user_oper(x.app_id,'SET_GIVE_CRED','CONTRACT_SIGNED'));
+
+			-- После 02/05 используется UserSignDog
+			if nvl(x.app_st, ' ')= 'Кредит выдан' then
+				for ( select q(q.[CL_WORK_USERS].[NAME_CHIEF] :FIO) in ::[CL_INFO_REQ] all
+			where q.[CLIENT]=x.DEBTOR_ID and q.[CL_WORK_USERS].[PERSON_TYPE].[CODE] = 'ACC_OPEN_USER' and q.[CL_WORK_USERS].[OPER_TYPE] = ::[VID_OPER_DOG]([CODE] = 'FIRST_ACCOUNT_OPEN'))
+				loop
+					&xl.Put(t, 71, q.FIO);
+				end loop;
+			end if;
+			UserSignDog:=null;
+			UserSignDog:=::[DNM_RL_APP].[LIB].GetAttr(x.ADD_ATTR, 'UserSignDog');
+			if not UserSignDog is null then
+				&xl.Put(t, 71, UserSignDog.[NAME]);
+			end if;
+			&xl.Put(t, 72, ::[DNM_RL_APP].[LIB].GetAttr(x.ADD_ATTR, 'FinalScoring'));
+			-- надо заполнять, если после этапа 3-4 не было повторного возврата на 3 этап, т.е. брать значения из последнего 3его этапа
+			user_name:=null;
+			
+			if x.TYPE_CRED != 'POTR' then --RM10623(kozlova_210323)
+				user_name:=::[DNM_RL_APP].[LIB_MOVING].get_date_change_user(x.app_id, '3', null, 'LOAN_OFFICER', false, null, date_et); -- -- стадия Решение Автокредит АТС ФИО
+				if not user_name is null then
+					resh_strategy:='';
+					resh_strategy := replace(::[DNM_RL_APP].[LIB_MOVING].get_state_change_user(x.app_id,'3',user_name,'APP_STATE',false),
+						'доработке', 'доработку');
+					if resh_strategy  in ('Одобрено','Отказ','На доработку') then
+						&xl.Put(t, 81, resh_strategy); -- стадия Решение Автокредит АТС  get_state_change_user
+						&xl.Put(t, 82, user_name);
+					end if;
+				else
+					user_name:=::[DNM_RL_APP].[LIB_MOVING].get_date_change_user(x.app_id, '3', null, 'APP_STATE', true, null, date_et); -- -- стадия Решение Автокредит АТС ФИО
+					if user_name like 'Strategy%' then
+						resh_strategy:='';
+						resh_strategy := nvl(::[DNM_RL_APP].[LIB_MOVING].get_state_change_user(x.app_id,'3','Dynamika_New ','APP_STATE',false),
+							::[DNM_RL_APP].[LIB_MOVING].get_state_change_user(x.app_id,'3','Dynamika_Front ','APP_STATE',false));
+						if resh_strategy  in ('Одобрено','Отказ','На доработке') then
+							&xl.Put(t, 81, replace(resh_strategy,'На доработке',''));
+							&xl.Put(t, 82, 'Strategy');
+						end if;
+					end if;
+				end if;
+			end if;
+			-- В колонку выводить аббревиатуру контролера, принявшего итоговое (последнее) решение по заявке на этапе решение:  ?Отказ?/ ?Одобрено?.
+			-- В настоящий момент итоговое решение по заявке может принять Strategy/ОКР/МКК/КС/КК ОО/ДО
+			-- надо исключить решение "MODIFICATION"
+			-- надо исключить ОБН
+			user_name:=null;
+			user_name:=::[DNM_RL_APP].[LIB_MOVING].get_date_change_user(x.app_id, '2', null, 'LOAN_OFFICER', false);
+			resh_date := [DNM_RL_APP].[LIB_MOVING].get_date_change(x.app_id, '2', null, 'LOAN_OFFICER', false)+ x.TIME_REGION;
+			-- RM 6133
+			resh_strategy := ::[DNM_RL_APP].[LIB_MOVING].get_date_change_user(x.app_id, '2', 'APPROVED',
+				'APP_STATE', /*RM11174 true*/ false);
+			resh_strategy := nvl(resh_strategy,
+				::[DNM_RL_APP].[LIB_MOVING].get_date_change_user(x.app_id,'2','REFUSE', 'APP_STATE', /*RM11174 true*/false));
+			if not user_name is null and nvl(resh_strategy, ' ')not like 'Strategy%' -- RM 6133
+			then -- если был реальный контролёр
+				if ::[DNM_RL_APP].[LIB_MOVING].get_state_change_user(x.app_id, '2', user_name, 'APP_STATE', false)!='На доработке' then
+					date_last_resh:=null;
+					date_last_resh:= ::[DNM_RL_APP].[LIB_MOVING].get_date_change(x.app_id, '2', '#APPROVED#REFUSE#', 'APP_STATE', false,
+						null, null, null);
+					begin
+						und:=::[DNM_RL_UNDER](trim([UNDER].[NAME])=user_name);
+						if nvl(::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,'ORG_RESOLUTION',date_last_resh),
+							und.[RULES])!='ОБН' then
+							&xl.Put(t, 83, und.[RULES]);
+							&xl.Put(t, 4, to_char(date_last_resh, 'dd.mm.yyyy hh24:mi:ss'));
+						end if;
+					exception when NO_DATA_FOUND then
+						und:=null;
+						if x.TYPE_CRED != 'POTR' then --RM10623(kozlova_210323)
+							if not user_name is null then
+								&xl.Put(t, 83, user_name || ' несуществующий пользователь');
+							end if;
+						end if;
+					when TOO_MANY_ROWS then
+						und:=null;
+						if not user_name is null then
+							date_last_resh:=null;
+							date_last_resh:= ::[DNM_RL_APP].[LIB_MOVING].get_date_change(x.app_id, '2', '#APPROVED#REFUSE#', 'APP_STATE',
+								false, null, null, null);
+							&xl.Put(t, 83,
+								replace(::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,'ORG_RESOLUTION',date_last_resh),'ОБН',''));
+							&xl.Put(t, 4, to_char(date_last_resh, 'dd.mm.yyyy hh24:mi:ss'));
+						end if;
+					end;
+				end if;
+			else -- если была стратегия / или контролёра еще не назначили (т.е. нет решения)
+			-- RM 6133 
+				user_name := resh_strategy;
+				if user_name like 'Strategy%' then
+					&xl.Put(t, 83, 'Strategy');
+					--<<RM10623(kozlova_210323)
+					if resh_date is null then
+						resh_date := [DNM_RL_APP].[LIB_MOVING].get_date_change(x.app_id, '2', '#APPROVED#REFUSE#', 'APP_STATE',
+							true)+ x.TIME_REGION;
+					end if;
+					-->>
+					&xl.Put(t, 4, to_char(resh_date, 'dd.mm.yyyy hh24:mi:ss'));
+				end if;
+				begin -- бывает, что контролёр принял решение, но в истории отсутствует запись с назначением контролёра LOAN_OFFICER; это странно, но бывает
+					und:=::[DNM_RL_UNDER](trim([UNDER].[NAME])=user_name);
+					date_last_resh:=null;
+					date_last_resh:= ::[DNM_RL_APP].[LIB_MOVING].get_date_change(x.app_id, '2', '#APPROVED#REFUSE#', 'APP_STATE', false,
+						null, null, null);
+					if x.TYPE_CRED != 'POTR' then --RM10623(kozlova_210323)
+						if nvl(::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,'ORG_RESOLUTION',date_last_resh),
+							und.[RULES])!='ОБН' then
+							&xl.Put(t, 83, und.[RULES]);
+						end if;
+					end if;
+				exception when NO_DATA_FOUND then
+					und:=null;
+					if x.TYPE_CRED != 'POTR' then --RM10623(kozlova_210323)
+						if user_name like 'Strategy%' then
+							&xl.Put(t, 83, 'Strategy');
+						end if;
+					end if;
+				when TOO_MANY_ROWS then
+					und:=null;
+					if x.TYPE_CRED != 'POTR' then --RM10623(kozlova_210323)
+						if not user_name is null then
+							date_last_resh:=null;
+							date_last_resh:= ::[DNM_RL_APP].[LIB_MOVING].get_date_change(x.app_id, '2', '#APPROVED#REFUSE#', 'APP_STATE',
+								false, null, null, null);
+							&xl.Put(t, 83,
+								replace(::[DNM_RL_APP].[LIB_MOVING].get_val_by_req_by_time(x.app_id,'ORG_RESOLUTION',date_last_resh),'ОБН',''));
+						end if;
+					end if;
+				end;
+				--  здесь запись является последней: APP_STATE	CONTROL	15/04/2021 11:30:29	DYNAMIKA_NEW
+				-- то есть, контролёр еще не назначен
+				null;
+			end if;
+			&xl.Put(t, 84, x.why);
+			if x.why='Отказ по результатам автоматических проверок' then
+				if x.STAGE <> '1' then --RM15763
+					&xl.Put(t, 83, 'Strategy');
+				end if;
+				&xl.Put(t, 84, 'Отказ по Strategy');
+			/*Отказ при расчете ПДН, ОД и т.д. В качестве даты принятия окончательного решения подойдет дата последней операции в заявке в заявке. Егоров Е.А. */
+				select t(max(t.[DATE_EDIT])) in x.[HIST_ARR] all
+				into resh_date;
+				&xl.Put(t, 4, to_char(resh_date, 'dd.mm.yyyy hh24:mi:ss'));
+			end if;
+			&xl.Put(t, 85, ::[DNM_RL_DIRECT].[LIB].GetName('WHY_REFUSE', x.WHY_REF));
+			&xl.Put(t, 86, x.refuse_loan_officer_reason);
+			for(
+			select com(com.[COMMENT] : C_COMMENT)
+			in x.[RL_COM]
+			order by com.[COMMENT_DATE] desc
+			fetch 1
+			)
+			loop
+				&xl.Put(t, 87, com.[C_COMMENT]);
+			end loop;
+			if x.app_st='У контролера' then
+				declare
+				rAppD ref [DNM_RL_APP];
+				begin
+					rAppD := x.app_id;
+					-- Rm 17146
+					for(select p(p.[VALUE] : val)
+						in rAppD.[ADD_ATTR]
+						where upper(p.[CODE])= 'CURRENT_PROCESSING'
+						fetch 1
+				)
+					loop
+						&xl.Put(t, 88, x.app_st||' '||p.val);
+					end loop;
+				end;
+			else
+				&xl.Put(t, 88, x.app_st);
+				if x.app_st='Отказ' then
+					&xl.Put(t, 71, '');
+				end if;
+				if x.app_st='На доработке' and x.why is null then
+					&xl.Put(t, 85,
+						::[DNM_RL_APP].[LIB_MOVING].get_comment(x.app_id, 'MODIFICATION_APP', ::[DNM_RL_APP].[LIB_MOVING].get_date_oper(x.app_id,'MODIFICATION_APP','MODIFICATION')));
+				end if;
+			end if;
+			etap:='';
+			etap := ::[DNM_RL_APP].[LIB_MOVING].get_stage_str(x.app_id);
+			&xl.Put(t, 89, etap);
+			if substr(etap, length(etap) - 1, 1)= '4' then
+				&xl.Put(t, 89, 'Выдача кредита');
+			elsif substr(etap, length(etap) - 1, 1)= '3' then
+				&xl.Put(t, 89, 'Решение АТС');
+			elsif substr(etap, length(etap) - 1, 1)= '2' then
+				&xl.Put(t, 89, 'Решение');
+			elsif substr(etap, length(etap) - 1, 1)= '1' then
+				&xl.Put(t, 89, 'Экспресс-оценка');
+			end if;
+			&xl.Put(t, 90, x.num_dog);
+			sum_ssud := 0;
+			sum_ssud := ::[PR_CRED].[L].GetSumDebt(x.cred_id, ::[VID_DEBT]([CODE] = 'КРЕДИТ'), V_DATE_REP);
+			sum_pro := 0;
+			sum_pro := ::[PR_CRED].[L].GetSumDebt(x.cred_id, ::[VID_DEBT]([CODE] = 'ПРОСРОЧ_КРЕДИТ'), V_DATE_REP);
+			&xl.Put(t, 91, sum_ssud);
+			&xl.Put(t, 92, sum_pro);
+			&xl.Put(t, 93, sum_ssud+sum_pro);
+			dd := null;
+			days := 0;
+			if not x.cred_id is null and sum_pro != 0 then
+				days := floor(::[PR_CRED].[LIB_BKI].find_srok_pr(x.cred_id,V_DATE_REP,dd)); --find_srok_pr // find_srok_pr_nbki ----dd - если просрочка погашена (days=0), то это дата гашения;  если просрочка не погашена, то это дата первого выноса
+			end if;
+			&xl.Put(t, 94, days);
+			if not x.cred_id is null then
+				days := ::[pr_cred].[L_ALEX_PRI].prosr_days_count_pos(x.cred_id, 2, V_DATE_REP);
+			end if;
+			&xl.Put(t, 95, days);
+			val:='';
+			for (
+			select q(q.[PDN_VALUE] :value) in x.PDN_ARR where q.[TYPE_CALC] order by q.[DATE_CALC] asc) --Бакаев Д.В 13/04/2023 RM 6275
+			loop
+				val:=nvl(q.VALUE, 0);
+				if substr(val, 1, 1)= '.' then
+					val := '0' || val;
+				end if;
+				&xl.Put(t, 96, val);
+			end loop;
+			val := '';
+			for (
+			select q(q.[PDN_VALUE] :value) in x.PDN_ARR where not q.[TYPE_CALC] order by q.[DATE_CALC] asc) --Бакаев Д.В 13/04/2023 RM 6275
+			loop
+				val := nvl(q.VALUE, 0);
+				if substr(val, 1, 1)= '.' then
+					val := '0' || val;
+				end if;
+				&xl.Put(t, 97, val);
+			end loop;
+			case x.CONSENT_TO_ADVERTISING of --Согласие на получение рекламных материалов
+			:'NO':
+			&xl.Put(t, 99, 'Нет');
+			:'YES' :
+			&xl.Put(t, 99, 'Да');
+		end;
+			--<<RM8950(kozlova_230123)
+			-- Кредитная карта к зарплатной
+			if x.INIT_WAY = 'CARD_AFTER_ZP' then
+				&xl.Put(t, 100, 'Зарп');
+			end if;
+			-->>
+			--peskov_av #19205 08.04.2024
+			&xl.Put(t, 101, ::[DNM_RL_APP].[LIB].GetElecSignClient(x.APP_ID));
+			--!peskov_av
+			--> Миролюбова А.А. RM 34780 01.04.2025 
+			&xl.Put(t, 102, ::[DNM_RL_APP].[LIB_FUNC].getSelfLocking(x.APP_ID));
+			--> !Миролюбова А.А.  RM 34780 01.04.2025 
+			-->RM 36474
+			&xl.Put(t, 103, ::[DNM_RL_APP].[LIB].okb_credit_rating(x.APP_ID,2));
+			&xl.Put(t, 104, ::[DNM_RL_APP].[LIB].okb_credit_rating(x.APP_ID,1));
+			&xl.Put(t,	105, x.MONTH_INCOME,1);
+			&xl.Put(t,	106, ::[DNM_RL_APP].[LIB].getScoreValue(x.APP_ID)); -- RM 19242		
+			for (
+				select cb(cb.[SCORE] : score) in x.CB_REQ_ARR order by cb.[DATE_REQ] desc fetch 1)
+			loop
+				if cb.score is not null 
+				then
+					&xl.Put(t, 107, cb.score);
+				else
+					&xl.Put(t, 107, 'Запрос не осуществлялся');	
+				end if;
+			end loop;
+					
+			t := t + 1;
+		end loop;
+	end;
+	-- Rm 6964
+	-- Функция создания записей во временной таблице
+	function init_temp_sheme_tbl return &temp.Temp_table is
+		t_val 			[DNM_TEMP_TBL];
+		t_val_ref ref 	[DNM_TEMP_TBL];
+		t_tbl 			&temp.Temp_table;
+	begin
+		&temp.ClearSessObj;
+		t_val%init(true, true);
+		t_val.[SESSION_ID] := &temp.Get_session_id;
+		t_val.[CLASS_ID] := ::[DNMR_SCHEME]%class;
+		t_val.[V1] := 'Все';
+		t_val.[B1] := true;
+		t_val.[N1] := t_tbl.count + 1;
+		t_val_ref := ::[DNM_TEMP_TBL]%insert(t_val);
+		t_tbl(t_tbl.count + 1):= t_val_ref;
+		for u in ::[DNMR_SCHEME] all
+	order by u.[CODE]
+		loop
+			t_val := null;
+			t_val_ref := null;
+			t_val%init(true, true);
+			t_val.[SESSION_ID] := &temp.Get_session_id;
+			t_val.[CLASS_ID] := ::[DNMR_SCHEME]%class;
+			t_val.[V1] := substr(u.[NAME], 1, 128);
+			t_val.[B1] := true;
+			t_val.[OBJ_ID] := u%id;
+			t_val.[N1] := t_tbl.count + 1;
+			t_val_ref := ::[DNM_TEMP_TBL]%insert(t_val);
+			t_tbl(t_tbl.count + 1):= t_val_ref;
+		end loop;
+		return t_tbl;
+	end;
+	-- Изменение признкаа выбора схем кредитования
+	procedure ChangeChooseStage(t_tbl in out	&temp.Temp_table) is
+		idx number;
+	begin
+		t_tbl(1).[B1] := not t_tbl(1).[B1];
+		idx := t_tbl.first;
+		while idx  is not null
+		loop
+			if idx = 1 then
+				idx := t_tbl.next(idx);
+			continue;
+			end if;
+			t_tbl(idx).[B1] := t_tbl(1).[B1];
+			idx := t_tbl.next(idx);
+		end loop;
+	end;
+	function getMaxUniPage(nCnt integer, nPageRow integer) return integer is
+		nPg	integer := 0;
+	begin
+		nPg := trunc(nCnt/nPageRow, 0);
+		if mod(t_tbl.count, nPageRow)!= 0 then
+			nPg := nPg + 1;
+		end if;
+		return greatest(nPg, 1);
+	end;
+	--> PSKB-6626. Логирование запуска отчета
+	procedure LogLaunch(p_crit varchar2(2000)) is
+		w integer;
+	begin
+		::[DNM_RL_LOG_REP].[NEW_AUTO](SYSDATE /*P_DATE_CREATE*/ --Дата формирования
+			, stdlib.userId /*P_USER*/ --Пользователь запустивший операцию
+			, p_crit /*P_CRITERIA*/ --Критерии выгрузки отчета
+		);
+	end;
+	--< PSKB-6626
+	public function getCities return V_CITYS%type is
+		res V_CITYS%type;
+	begin
+		res(1).[BOOL]:=true;
+		res(1).[STR]:='Все';
+		res(2).[BOOL]:=true;
+		res(2).[STR]:='Владивосток';
+		res(3).[BOOL]:=true;
+		res(3).[STR]:='Арсеньев';
+		res(4).[BOOL]:=true;
+		res(4).[STR]:='Артем';
+		res(5).[BOOL]:=true;
+		res(5).[STR]:='Большой Камень';
+		res(6).[BOOL]:=true;
+		res(6).[STR]:='Фокино';
+		res(7).[BOOL]:=true;
+		res(7).[STR]:='Дальнегорск';
+		res(8).[BOOL]:=true;
+		res(8).[STR]:='Кавалерово';
+		res(9).[BOOL]:=true;
+		res(9).[STR]:='Чугуевка';
+		res(10).[BOOL]:=true;
+		res(10).[STR]:='Ольга';
+		res(11).[BOOL]:=true;
+		res(11).[STR]:='Петропавловск-Камчатский';
+		res(12).[BOOL]:=true;
+		res(12).[STR]:='Находка';
+		res(13).[BOOL]:=true;
+		res(13).[STR]:='Уссурийск';
+		res(14).[BOOL]:=true;
+		res(14).[STR]:='Хабаровск';
+		res(15).[BOOL]:=true;
+		res(15).[STR]:='Екатеринбург';
+		res(16).[BOOL]:=true;
+		res(16).[STR]:='Омск';
+		res(17).[BOOL]:=true;
+		res(17).[STR]:='Иркутск';
+		res(18).[BOOL]:=true;
+		res(18).[STR]:='Москва';
+		res(19).[BOOL]:=true;
+		res(19).[STR]:='Санкт-Петербург';
+		res(20).[BOOL]:=true;
+		res(20).[STR]:='Челябинск';
+		res(21).[BOOL]:=true;
+		res(21).[STR]:='Елизово';
+		res(22).[BOOL]:=true;
+		res(22).[STR]:='Дунай';
+		res(23).[BOOL]:=true;
+		res(23).[STR]:='Нижний Новгород';
+		res(24).[BOOL]:=true;
+		res(24).[STR]:='Мини ДО';
+		return res;
+	end;
+	DNM_RL_REP_POTR (
+		@name('VW_CRIT_DNMR_SHEME') P_SHEMA_UNI in table of [DNM_UNIVERS_GRID]
+	) is
+		validate is
+			i 			integer;
+			nPageRows	integer := 200; -- Количество записей на странице
+		Begin
+			If P_MESSAGE = 'DEFAULT' Then
+				V_DATE_REP          := sysdate;
+				V_CREATE_BEG		:= trunc(sysdate, 'mm');
+				V_CREATE_END		:= sysdate;
+				V_OKR               := true;
+				V_OBN               := true;
+				V_MKK               := true;
+				V_OO                := true;
+				VO_CONTR_NULL       := true;
+				V_CITYS 			:= getCities();
+				-- RM 6964
+				-- схемы кредитования
+				nPage := 1;
+				t_tbl := init_temp_sheme_tbl;
+				[DNM_P]::[LIB].Force_Refresh_Grid('P_SHEMA_UNI');
+			ElsIf P_MESSAGE = 'VALIDATE' Then
+				if P_INFO = 'OK' Then
+					If V_CREATE_BEG is null OR V_CREATE_END is null then
+						pragma error('Для формирования отчета указание периода является обязательным, пожалуйста, укажите дату начала заполнения заявки и дату окончания заполнения заявки.');
+					End if;
+				End If;
+				-- Населенные пункты %VAR%.V_CITYS.rowColChange.1.0
+				if p_info = '%VAR%.V_CITYS.rowColChange.1.0' then
+					if V_CITYS(1).[BOOL] then
+						i:=2;
+						while i<=24
+						loop
+							V_CITYS(i).[BOOL]:=true;
+							i:=i+1;
+						end loop;
+					end if;
+					if not V_CITYS(1).[BOOL] then
+						i:=2;
+						while i<=24
+						loop
+							V_CITYS(i).[BOOL]:=false;
+							i:=i+1;
+						end loop;
+					end if;
+				end if;
+				-- RM 6964
+				-- Работа со страницами универсального грида
+				if p_info = 'button_P_SHEMA_UNI_next' then
+					nPage := least(nPage + 1, getMaxUniPage(t_tbl.count, nPageRows));
+				elsif p_info = 'button_P_SHEMA_UNI_prev' then
+					nPage := greatest(nPage - 1, 1);
+				elsif p_info = 'button_P_SHEMA_UNI_first' then
+					nPage := 1;
+				elsif p_info = 'button_P_SHEMA_UNI_last' then
+					nPage := getMaxUniPage(t_tbl.count, nPageRows);
+				end if;
+				-- Схемы кредитования %VAR%.V_SHEMA.rowColChange.1.0
+				if p_info like '%P_SHEMA_UNI.rowColChange.1.1%' and nPage = 1 then
+					ChangeChooseStage(t_tbl);
+					[DNM_P]::[LIB].Force_Refresh_Grid('P_SHEMA_UNI');
+				elsif p_info like '%P_SHEMA_UNI.rowColChange.%.1%' then
+					declare
+					select_idx number;
+					begin
+						select_idx := substr(p_info, instr(p_info,'rowColChange.')+length('rowColChange.'),
+							instr(p_info, '.',-1)- (instr(p_info,'rowColChange.')+length('rowColChange.')));
+						select_idx := select_idx + (nPage - 1)*nPageRows;
+						t_tbl(select_idx).[B1] :=  not t_tbl(select_idx).[B1];
+						[DNM_P]::[LIB].Force_Refresh_Grid('P_SHEMA_UNI');
+					end;
+				end if;
+				if p_info = '%VAR%.V_CLOSE_NULL' then
+					if V_CLOSE_NULL then
+						[CSMD].DisableS(V_DEST_STR, 'Date6');
+						[CSMD].DisableS(V_DEST_STR, 'Date7');
+					end if;
+					if not V_CLOSE_NULL then
+						[CSMD].EnableS(V_DEST_STR, 'Date6');
+						[CSMD].EnableS(V_DEST_STR, 'Date7');
+					end if;
+				end if;
+				if p_info = 'CANCEL' then
+					&temp.ClearSessObj;
+				end if;
+			End If;
+		End;
+		execute is
+			vDescription varchar2(2000);
+			vFileName varchar2;
+			docx		blob := empty_blob();
+			--> PSKB-6626
+			vCrit varchar2(2000);
+		--< PSKB-6626
+		Begin
+			&debug_output('+ Формирование таблицы "Текущий отчет"', 0);
+			-- Открытие шаблона
+			&lp.xl_init('DNM_RL_REP_POTR');
+			-- Формирование выписки
+			WRITE_HEADER;
+			-- формируем описание параметров запуска
+			vDescription := 'Отчет за период: '||to_char(V_CREATE_BEG, 'dd/mm/yyyy')||' - '||to_char(V_CREATE_END, 'dd/mm/yyyy');
+			-->DNM
+			-- Сохранение сформированного файла
+			docx := &lp.xl_finish(P_DESCRIPTION == vDescription, p_show == true);
+			vFileName := 'DNM_RL_REP_POTR_'||dbms_random.string('', 8);
+			[DNM_P]::[PRINT_LIB].ADD(docx, vFileName, 'xlsx', vDescription);
+			&debug_output('- Завершено формирование таблицы', 0);
+			&temp.ClearSessObj; -- RM 6964
+			--> PSKB-6626. Логирование запуска отчета
+			--Собираем значение критериев запуска для логирования
+			begin
+				vCrit := '# Дата состояния задолженноти: '||to_char(V_DATE_REP, 'dd/mm/yyyy')||' #';
+				vCrit := vCrit || chr(10)|| '# Период создания заявок: '||NVL(to_char(V_CREATE_BEG, 'dd/mm/yyyy'),
+					'Пусто')||' - '||NVL(to_char(V_CREATE_END,'dd/mm/yyyy'), 'Пусто')|| ' #';
+				vCrit := vCrit || chr(10)|| '# Период подписания договоров заявок: '||NVL(to_char(V_SIGN_BEG, 'dd/mm/yyyy'),
+					'Пусто')||' - '||NVL(to_char(V_SIGN_END,'dd/mm/yyyy'), 'Пусто')|| ' #';
+				vCrit := vCrit || chr(10)|| '# Период планируемого закрытия: '||NVL(to_char(V_CLOSE_BEG, 'dd/mm/yyyy'),
+					'Пусто')||' - '||NVL(to_char(V_CLOSE_END,'dd/mm/yyyy'), 'Пусто')|| ' #';
+				vCrit := vCrit || chr(10)|| '# Канал продаж: '|| NVL(V_SOURCE.[NAME], 'Пусто')|| ' #';
+				vCrit := vCrit || chr(10)|| '# ОКРРБ: '|| case V_OKR when true then 'Да' else 'Нет' end || ' #';
+				vCrit := vCrit || chr(10)|| '# ОБН: '|| case V_OBN when true then 'Да' else 'Нет' end || ' #';
+				vCrit := vCrit || chr(10)|| '# МККиКС: '|| case V_MKK when true then 'Да' else 'Нет' end || ' #';
+				vCrit := vCrit || chr(10)|| '# КК ОО и ДО: '|| case V_OO when true then 'Да' else 'Нет' end || ' #';
+				vCrit := vCrit || chr(10)|| '# Нет контролёра: '|| case VO_CONTR_NULL when true then 'Да' else 'Нет' end || ' #';
+				vCrit := vCrit || chr(10)|| '# Номер договора: '|| NVL(V_CRED_NUM, 'Пусто')|| ' #';
+				vCrit := vCrit || chr(10)|| '# Сумма кредита: с '||NVL(to_char(V_SUM_BEG), 'Пусто')||' по '||NVL(to_char(V_SUM_END),
+					'Пусто')|| ' #';
+				vCrit := vCrit || chr(10)|| '# ФИО клиента: '|| NVL(V_FIO, 'Пусто')|| ' #';
+				vCrit := vCrit || chr(10)|| '# Статус заявки: '|| NVL(V_SOST_APP.[NAME], 'Пусто')|| ' #';
+				-- Передаём критерии в функцию логирования
+				LogLaunch(vCrit);
+			exception when others then
+				-- Отправим в логирование полученную строку до момента ошибки
+				LogLaunch(vCrit);
+			end;
+		--< PSKB-6626
+		End;
+	end;
+end;
